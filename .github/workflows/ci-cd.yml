@@ -17,9 +17,10 @@ jobs:
   build_and_test_java:
     name: Build Java & Submit Dependency Graph
     runs-on: ubuntu-latest
-    outputs: # Define outputs to be used by other jobs
-      # The artifact upload action v4 doesn't directly output the path in the same way.
-      # We'll rely on the known artifact name.
+    permissions:
+      contents: write # CHANGED: Needs 'write' to submit dependency graph
+      # Add other permissions if other steps in this job need them
+    outputs:
       jar_artifact_name: app-jar # The name of the artifact
     steps:
       - name: Checkout code
@@ -36,10 +37,11 @@ jobs:
         run: mvn -B package --file pom.xml # -B for batch mode. 'package' also runs 'test'.
 
       - name: Update dependency graph (for Dependabot alerts)
-        uses: advanced-security/maven-dependency-submission-action@571e99aab1055c2e71a1e2309b9691de18d6b7d6 # Using specific commit from template
+        uses: advanced-security/maven-dependency-submission-action@v4.0.0 # UPDATED to a version tag
+        # This action uses the GITHUB_TOKEN which now has 'contents: write'
 
       - name: Upload JAR artifact
-        uses: actions/upload-artifact@v4 # UPDATED
+        uses: actions/upload-artifact@v4
         with:
           name: app-jar # Name of the artifact (outputted for other jobs)
           path: target/*.jar # Path to the JAR file(s)
@@ -59,13 +61,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # We assume this is primarily a Java project.
-        # 'actions' language scans the workflow files themselves.
-        # 'java-kotlin' for Java (and Kotlin if present).
         include:
           - language: java-kotlin
-            build-mode: none # Analyzes Java. Set to 'autobuild' or 'manual' for Kotlin.
-          - language: actions # To scan workflow files for security issues
+            build-mode: none
+          - language: actions
             build-mode: none
     steps:
       - name: Checkout repository
@@ -76,7 +75,6 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # queries: security-extended,security-and-quality # Optional: custom queries
 
       - if: matrix.build-mode == 'manual'
         shell: bash
@@ -94,61 +92,54 @@ jobs:
     name: Build, Scan, & Push Docker Image
     needs: [build_and_test_java, static_code_analysis_codeql] # Depends on Java build (for JAR) and SAST
     runs-on: ubuntu-latest
-    outputs: # Define outputs for the deploy job
+    outputs:
         ghcr_image_name: ${{ steps.image_defs.outputs.GHCR_IMAGE_NAME }}
         ghcr_image_tag: ${{ steps.image_defs.outputs.GHCR_IMAGE_TAG }}
     permissions:
-      contents: read          # For checkout
-      packages: write         # To push to GHCR
-      security-events: write  # For Grype to upload SARIF results
+      contents: read
+      packages: write
+      security-events: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Download JAR artifact
-        uses: actions/download-artifact@v4 # UPDATED
+        uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.build_and_test_java.outputs.jar_artifact_name }} # Use output from build job
-          path: ./jar-artifact # Download to a specific path in the workspace
+          name: ${{ needs.build_and_test_java.outputs.jar_artifact_name }}
+          path: ./jar-artifact
 
       - name: Display downloaded JAR structure (for debugging)
         run: |
           echo "Listing contents of ./jar-artifact:"
           ls -R ./jar-artifact
-          # Your Dockerfile will need to COPY the JAR from this location,
-          # e.g., COPY ./jar-artifact/*.jar /app/app.jar
 
-      - name: Set up Docker Buildx (recommended for building images)
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Define image name and tags
       - name: Define Image Tags
         id: image_defs
         run: |
           echo "GRYPE_IMAGE_TAG=localbuild/myapp-for-grype:latest" >> $GITHUB_OUTPUT
-          # Ensure GHCR image name is lowercase as per Docker image naming conventions
           GHCR_REPO_NAME_LOWER=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
           echo "GHCR_IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/$GHCR_REPO_NAME_LOWER" >> $GITHUB_OUTPUT
           echo "GHCR_IMAGE_TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
 
-
       - name: Build the Docker image for Grype Scan
         run: |
-          # Ensure your Dockerfile is in the root or adjust path.
-          # The Dockerfile should COPY the JAR from ./jar-artifact/*.jar
           docker build . --file Dockerfile --tag ${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }}
 
       - name: Run Anchore Grype scan
-        uses: anchore/scan-action@d5aa5b6cb9414b0c7771438046ff5bcfa2854ed7 # Using specific commit from template
+        uses: anchore/scan-action@d5aa5b6cb9414b0c7771438046ff5bcfa2854ed7
         id: grypescan
         with:
           image: "${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }}"
-          fail-build: true             # Fail the build if vulnerabilities are found
-          severity-cutoff: critical    # Report and fail on critical vulnerabilities
+          fail-build: true
+          severity-cutoff: critical
 
       - name: Upload Grype vulnerability report (SARIF)
         uses: github/codeql-action/upload-sarif@v3
-        if: success() || failure() # Upload SARIF regardless of Grype outcome for review
+        if: success() || failure()
         with:
           sarif_file: ${{ steps.grypescan.outputs.sarif }}
 
@@ -170,8 +161,8 @@ jobs:
   # Stage 4: Placeholder for Deployment
   deploy_placeholder:
     name: Deploy Application (Placeholder)
-    needs: build_scan_and_push_docker # Depends on successful image build, scan, and push
-    if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push' # Only deploy on successful main branch pushes
+    needs: build_scan_and_push_docker
+    if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Deployment steps would go here
@@ -179,8 +170,3 @@ jobs:
           echo "Simulating deployment..."
           echo "Image to deploy: ${{ needs.build_scan_and_push_docker.outputs.ghcr_image_name }}:${{ needs.build_scan_and_push_docker.outputs.ghcr_image_tag }}"
           echo "For example, using Helm to deploy to Kubernetes (AKS or Docker Desktop K8s)."
-          # Example:
-          # helm upgrade --install my-app ./path/to/helm-chart \
-          #   --set image.repository=${{ needs.build_scan_and_push_docker.outputs.ghcr_image_name }} \
-          #   --set image.tag=${{ needs.build_scan_and_push_docker.outputs.ghcr_image_tag }} \
-          #   --namespace my-namespace
