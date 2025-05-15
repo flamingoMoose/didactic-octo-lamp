@@ -111,9 +111,6 @@ jobs:
         run: |
           echo "Listing contents of ./jar-artifact:"
           ls -R ./jar-artifact
-          # Ensure your Dockerfile copies the JAR from this location, e.g.,
-          # COPY ./jar-artifact/simple-webapp-*.jar app.jar
-          # Or, if your Dockerfile builds the JAR itself (multi-stage), this download might be for other purposes or not strictly needed for the Docker build step.
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -122,39 +119,35 @@ jobs:
         id: image_defs
         run: |
           echo "GRYPE_IMAGE_TAG=localbuild/myapp-for-grype:latest" >> $GITHUB_OUTPUT
+          # Ensure both repository owner and repository name are lowercase for GHCR
+          GHCR_OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           GHCR_REPO_NAME_LOWER=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-          echo "GHCR_IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/$GHCR_REPO_NAME_LOWER" >> $GITHUB_OUTPUT
+          echo "GHCR_IMAGE_NAME=ghcr.io/$GHCR_OWNER_LOWER/$GHCR_REPO_NAME_LOWER" >> $GITHUB_OUTPUT
           echo "GHCR_IMAGE_TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Build the Docker image for Grype Scan
         run: |
-          # Ensure your Dockerfile is in the root or adjust path.
-          # If your Dockerfile is multi-stage and builds the JAR, it uses source from checkout.
-          # If your Dockerfile expects a pre-built JAR, ensure it copies from ./jar-artifact
           docker build . --file Dockerfile --tag ${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }}
 
       - name: Run Anchore Grype scan
-        uses: anchore/scan-action@v3.4.0 # UPDATED to a more recent stable version tag
+        uses: anchore/scan-action@v3.4.0
         id: grypescan
         with:
           image: "${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }}"
-          fail-build: false             # This will still fail the job if critical vulns are found
-          severity-cutoff: critical    # Adjust as needed for learning, but be aware of risks
-          # To allow the pipeline to continue for learning purposes even with critical findings:
-          # fail-build: false
+          fail-build: false            # UPDATED: Allows pipeline to continue even if vulnerabilities are found
+          severity-cutoff: critical    # Scan will still report critical issues
           # To specify the SARIF output file name (though default is results.sarif)
           # sarif_file: "my-grype-results.sarif"
 
       - name: Upload Grype vulnerability report (SARIF)
-        uses: github/codeql-action/upload-sarif@v3 # Consider updating to v3 if v2 is used
-        if: success() || failure() # Attempt to upload SARIF even if Grype step fails due to vulnerabilities
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure() # Attempt to upload SARIF even if Grype step technically "failed" due to findings (when fail-build:true) or passed (when fail-build:false)
         with:
           sarif_file: ${{ steps.grypescan.outputs.sarif }} # This refers to the output variable from the scan action
 
-      # Subsequent steps will only run if the Grype scan passes (due to fail-build: true)
-      # or if fail-build is set to false.
       - name: Login to GitHub Container Registry
-        if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        # This step will now run if Grype scan step completes (even if it found issues, because fail-build is false)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -162,7 +155,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Re-tag image for GHCR and Push
-        if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           docker tag ${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }} ${{ steps.image_defs.outputs.GHCR_IMAGE_NAME }}:${{ steps.image_defs.outputs.GHCR_IMAGE_TAG }}
           docker push ${{ steps.image_defs.outputs.GHCR_IMAGE_NAME }}:${{ steps.image_defs.outputs.GHCR_IMAGE_TAG }}
