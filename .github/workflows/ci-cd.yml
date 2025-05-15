@@ -1,66 +1,200 @@
-name: CI/CD Pipeline
+# This workflow combines Java CI, CodeQL SAST, Docker build, and Grype container scanning.
+name: Comprehensive CI/CD Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+    branches: [ "main" ]
+  schedule:
+    # Scheduled runs from CodeQL and Grype templates
+    - cron: '29 0 * * 1' # From CodeQL (e.g., Monday at 00:29 UTC)
+    - cron: '30 5 * * 0' # From Grype (e.g., Sunday at 05:30 UTC)
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
-  build:
+  # Stage 1: Build Java application and run tests
+  build_and_test_java:
+    name: Build Java & Submit Dependency Graph
     runs-on: ubuntu-latest
+    outputs: # Define outputs to be used by other jobs
+      jar_path: ${{ steps.upload_jar.outputs.artifact_path }} # Path to the uploaded JAR artifact
+      jar_name: app-jar # The name of the artifact
     steps:
-      - uses: actions/checkout@v3
-      
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Set up JDK 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: maven
-      
-      - name: Build with Maven
-        run: mvn -B package --file pom.xml
-      
-      - name: Run tests
-        run: mvn test
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: app
-          path: target/simple-webapp-*.jar
 
-  security:
-    needs: build
+      - name: Build with Maven (includes tests)
+        run: mvn -B package --file pom.xml # -B for batch mode. 'package' also runs 'test'.
+
+      - name: Update dependency graph (for Dependabot alerts)
+        uses: advanced-security/maven-dependency-submission-action@571e99aab1055c2e71a1e2309b9691de18d6b7d6 # Using specific commit from template
+
+      - name: Upload JAR artifact
+        id: upload_jar # Give an ID to reference its outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar # Name of the artifact
+          path: target/*.jar # Path to the JAR file(s)
+          # retention-days: 5 # Optional: how long to keep the artifact
+
+  # Stage 2: Static Code Analysis with CodeQL
+  static_code_analysis_codeql:
+    name: CodeQL SAST Analysis
+    needs: build_and_test_java # Run after Java build to ensure code is buildable
+    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    permissions:
+      security-events: write # required for all workflows
+      packages: read         # required to fetch internal or private CodeQL packs
+      actions: read          # only required for workflows in private repositories
+      contents: read         # only required for workflows in private repositories
+    strategy:
+      fail-fast: false
+      matrix:
+        # We assume this is primarily a Java project.
+        # 'actions' language scans the workflow files themselves.
+        # 'java-kotlin' for Java (and Kotlin if present).
+        include:
+          - language: java-kotlin
+            build-mode: none # Analyzes Java. Set to 'autobuild' or 'manual' for Kotlin.
+          - language: actions # To scan workflow files for security issues
+            build-mode: none
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Setup JDK for CodeQL Java analysis if not implicitly handled by 'build-mode: none'
+      # For 'autobuild' or 'manual' for Java, CodeQL might need a build to happen after init.
+      # Since we have a separate build job, 'build-mode: none' for java-kotlin should be fine
+      # if it primarily analyzes source without needing a full re-build within CodeQL steps.
+      # If CodeQL for Java requires build artifacts, this job might need to download them
+      # or the CodeQL init/analyze steps might need to be part of the 'build_and_test_java' job
+      # or a job that has access to the build environment.
+      # For simplicity with 'build-mode: none', we assume it can analyze source effectively here.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # queries: security-extended,security-and-quality # Optional: custom queries
+
+      # If using 'manual' build mode for any language in the matrix, a build step would be needed here.
+      # The provided template has a placeholder for this.
+      - if: matrix.build-mode == 'manual'
+        shell: bash
+        run: |
+          echo "Manual build steps for ${{ matrix.language }} would go here."
+          echo "This example assumes 'build-mode: none' or 'autobuild' is sufficient."
+          # exit 1 # Remove or comment this if not actually failing for manual placeholder
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+
+  # Stage 3: Build Docker Image, Scan with Grype, and Push to Registry
+  build_scan_and_push_docker:
+    name: Build, Scan, & Push Docker Image
+    needs: [build_and_test_java, static_code_analysis_codeql] # Depends on Java build (for JAR) and SAST
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read          # For checkout
+      packages: write         # To push to GHCR
+      security-events: write  # For Grype to upload SARIF results
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build_and_test_java.outputs.jar_name }} # Use output from build job
+          path: ./jar-artifact # Download to a specific path in the workspace
+
+      - name: Display downloaded JAR structure (for debugging)
+        run: |
+          echo "Listing contents of ./jar-artifact:"
+          ls -R ./jar-artifact
+          # Your Dockerfile will need to COPY the JAR from this location,
+          # e.g., COPY ./jar-artifact/*.jar /app/app.jar
+
+      - name: Set up Docker Buildx (recommended for building images)
+        uses: docker/setup-buildx-action@v3
+
+      # Define image name and tags
+      # Using a fixed tag for Grype scan, and a dynamic tag for GHCR push
+      - name: Define Image Tags
+        id: image_defs
+        run: |
+          echo "GRYPE_IMAGE_TAG=localbuild/myapp-for-grype:latest" >> $GITHUB_OUTPUT
+          echo "GHCR_IMAGE_NAME=$(echo ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "GHCR_IMAGE_TAG=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+
+      - name: Build the Docker image for Grype Scan
+        run: |
+          # Ensure your Dockerfile is in the root or adjust path.
+          # The Dockerfile should COPY the JAR from ./jar-artifact/*.jar
+          docker build . --file Dockerfile --tag ${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }}
+
+      - name: Run Anchore Grype scan
+        uses: anchore/scan-action@d5aa5b6cb9414b0c7771438046ff5bcfa2854ed7 # Using specific commit from template
+        id: grypescan
+        with:
+          image: "${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }}"
+          fail-build: true             # Fail the build if vulnerabilities are found
+          severity-cutoff: critical    # Report and fail on critical vulnerabilities
+          # acs-report-enable: true    # If you use Anchore Enterprise reporting
+
+      - name: Upload Grype vulnerability report (SARIF)
+        uses: github/codeql-action/upload-sarif@v3
+        # Condition: always() to upload even if previous steps fail (e.g., Grype found issues)
+        # However, if fail-build is true in Grype, the job stops.
+        # If you want to upload SARIF even if Grype fails the build, Grype's fail-build: false
+        # and then check scan results to fail the job conditionally.
+        # For now, this will only run if Grype scan step passes (or fail-build is false).
+        if: success() || failure() # Upload SARIF regardless of Grype outcome for review
+        with:
+          sarif_file: ${{ steps.grypescan.outputs.sarif }}
+
+      # Re-tag the image for GHCR and push only if on main branch and previous steps are successful
+      # (Grype scan with fail-build:true would have stopped the job if issues were found)
+      - name: Login to GitHub Container Registry
+        if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-tag image for GHCR and Push
+        if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          docker tag ${{ steps.image_defs.outputs.GRYPE_IMAGE_TAG }} ${{ steps.image_defs.outputs.GHCR_IMAGE_NAME }}:${{ steps.image_defs.outputs.GHCR_IMAGE_TAG }}
+          docker push ${{ steps.image_defs.outputs.GHCR_IMAGE_NAME }}:${{ steps.image_defs.outputs.GHCR_IMAGE_TAG }}
+          echo "Image pushed: ${{ steps.image_defs.outputs.GHCR_IMAGE_NAME }}:${{ steps.image_defs.outputs.GHCR_IMAGE_TAG }}"
+
+  # Stage 4: Placeholder for Deployment
+  deploy_placeholder:
+    name: Deploy Application (Placeholder)
+    needs: build_scan_and_push_docker # Depends on successful image build, scan, and push
+    if: success() && github.ref == 'refs/heads/main' && github.event_name == 'push' # Only deploy on successful main branch pushes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: maven
-      
-      - name: Run Snyk to check for vulnerabilities
-        uses: snyk/actions/maven@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
-
-  deploy:
-    needs: [build, security]
-    runs-on: ubuntu-latest
-    # In a real scenario, you would deploy to your server or cloud provider
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: app
-          
-      - name: Display structure of downloaded files
-        run: ls -R 
+      - name: Deployment steps would go here
+        run: |
+          echo "Simulating deployment..."
+          echo "Image to deploy would be based on outputs from previous job (e.g., using ${{ needs.build_scan_and_push_docker.outputs.GHCR_IMAGE_NAME }}:${{ needs.build_scan_and_push_docker.outputs.GHCR_IMAGE_TAG }})"
+          echo "For example, using Helm to deploy to Kubernetes (AKS or Docker Desktop K8s)."
+          # Example:
+          # helm upgrade --install my-app ./path/to/helm-chart \
+          #   --set image.repository=${{ needs.build_scan_and_push_docker.outputs.GHCR_IMAGE_NAME }} \
+          #   --set image.tag=${{ needs.build_scan_and_push_docker.outputs.GHCR_IMAGE_TAG }} \
+          #   --namespace my-namespace
